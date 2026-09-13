@@ -6,7 +6,7 @@ import { parseCommand } from '@deepseek-ai/dsh-commands'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { parseApprovalCommand } from './approvals.js'
 import type { Config } from './config.js'
-import { ConversationManager, type ConversationReply } from './conversations.js'
+import { ConversationManager, type ConversationReply, type WorkhubReviewDecision } from './conversations.js'
 import { displayQr, loginWithQr } from './login.js'
 import { filterMarkdownForWeixin } from './markdown-filter.js'
 import { WeixinApiClient, type WeixinApiPort } from './protocol.js'
@@ -18,7 +18,7 @@ import {
   type WeixinCredential,
   type WeixinMessage,
 } from './types.js'
-import { delay, messageKey, SeenMessageIds, truncateUtf8 } from './util.js'
+import { delay, messageKey, SeenMessageIds, sessionIdFor, truncateUtf8 } from './util.js'
 
 const STALE_TOKEN_CODE = -14
 const OUTBOUND_TEST_PNG = Buffer.from(
@@ -34,6 +34,11 @@ export type WeixinLogin = typeof loginWithQr
 
 /** Injectable QR renderer used by terminal login and tests. */
 export type WeixinQrDisplay = (url: string) => Promise<void>
+
+interface WorkhubChannelTransport {
+  register(channel: 'wecom' | 'weixin', sender: { sendText: (targetId: string, text: string) => Promise<void> }): () => void
+  registerReviewHandler(channel: 'weixin' | 'wecom', handler: (job: { id: string; claimToken: string; sourceSessionId: string; targetId: string; reviewPrompt: Record<string, unknown> }) => Promise<WorkhubReviewDecision>): () => void
+}
 
 /** Outcome of an explicit login request from a Harness command surface. */
 export type WeixinLoginRequest = {
@@ -71,6 +76,7 @@ export class WeixinHarnessBridge {
   private monitorAbortController: AbortController | undefined
   private disconnectTask: Promise<void> | undefined
   private connectionAttempt: ConnectionAttempt | undefined
+  private unregisterWorkhubTransport: (() => void) | undefined
   private connected = false
   private stopping = false
 
@@ -222,7 +228,21 @@ export class WeixinHarnessBridge {
         this.log.error('Weixin monitor stopped unexpectedly: %s', String(error))
       }
     })
+    this.registerWorkhubTransport(api)
     return credential
+  }
+
+  private registerWorkhubTransport(api: WeixinApiPort): void {
+    const transport = (this.ctx as unknown as { workhubChannelTransport?: WorkhubChannelTransport }).workhubChannelTransport
+    if (!transport) return
+    this.unregisterWorkhubTransport?.()
+    const unregisterSender = transport.register('weixin', {
+      sendText: async (targetId, text) => {
+        await api.sendText(targetId, filterMarkdownForWeixin(truncateUtf8(text, this.config.maxReplyBytes)))
+      },
+    })
+    const unregisterReview = transport.registerReviewHandler('weixin', job => this.requireConversations().enqueueWorkhubReview(job.sourceSessionId, job.reviewPrompt))
+    this.unregisterWorkhubTransport = () => { unregisterReview(); unregisterSender() }
   }
 
   private async resolveCredential(forceQr: boolean, attempt: ConnectionAttempt): Promise<WeixinCredential> {
@@ -334,6 +354,8 @@ export class WeixinHarnessBridge {
     const conversations = this.conversations
     const api = this.api
     const credential = this.credential
+    this.unregisterWorkhubTransport?.()
+    this.unregisterWorkhubTransport = undefined
     this.connected = false
     monitorAbortController?.abort(new Error('微信连接正在切换'))
     conversations?.cancelPendingApprovals()
@@ -359,6 +381,7 @@ export class WeixinHarnessBridge {
     const sender = message.from_user_id?.trim()
     if (!sender || !this.allowed(sender)) return
     if (this.seen.hasOrAdd(messageKey(message))) return
+    this.emitWorkhubInbound(message)
     const command = commandText(message)
     const bypassCapacity = command === '/bot-cancel'
       || command === '/new'
@@ -373,6 +396,26 @@ export class WeixinHarnessBridge {
     })
     const tracked = task.finally(() => this.inFlight.delete(tracked))
     this.inFlight.add(tracked)
+  }
+
+  private emitWorkhubInbound(message: WeixinMessage): void {
+    const emit = (this.ctx as unknown as { emit?: (event: string, payload: unknown) => void }).emit
+    const senderId = message.from_user_id?.trim()
+    if (!emit || !senderId) return
+    const targetId = senderId
+    emit('workhub/channel-inbound', {
+      channel: 'weixin',
+      externalEventId: messageKey(message),
+      senderId,
+      conversationId: message.group_id?.trim() || targetId,
+      targetId,
+      conversationType: message.group_id?.trim() ? 'group' : 'direct',
+      messageType: 'text',
+      content: messageText(message),
+      dshSessionId: sessionIdFor(this.credential?.accountId ?? 'default', message),
+      receivedAt: message.create_time_ms ? new Date(message.create_time_ms).toISOString() : undefined,
+      metadata: { channelNativeTarget: targetId },
+    })
   }
 
   private allowed(sender: string): boolean {
@@ -525,6 +568,7 @@ export class WeixinHarnessBridge {
   }
 
   private async sendReply(message: WeixinMessage, api: WeixinApiPort, reply: ConversationReply): Promise<void> {
+    if (reply.suppressDelivery) return
     const to = message.from_user_id?.trim()
     if (!to) throw new Error('Weixin reply has no target user')
     const images = reply.images.slice(0, this.config.maxReplyImages)

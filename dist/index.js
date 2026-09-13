@@ -17,7 +17,7 @@ import {
   truncateUtf8,
   waitForLoginFromControlSocket,
   withTimeout
-} from "./chunk-KCZ7FGE3.js";
+} from "./chunk-BBVIPL5P.js";
 
 // src/bridge.ts
 import { createHash } from "crypto";
@@ -28,11 +28,34 @@ import { credentialRef } from "@deepseek-ai/dsh-credentials";
 
 // src/approvals.ts
 import { randomInt } from "crypto";
+
+// src/dsh-compat.ts
+function sessionEvents(agent) {
+  const session = agent.session;
+  return session.snapshotEvents?.() ?? session.events ?? [];
+}
+async function inspectSession(ctx, id) {
+  const persistence = ctx.sessionPersistence;
+  if (persistence.inspect !== void 0) return persistence.inspect(id);
+  if (persistence.open === void 0) throw new Error("DSH session persistence does not support inspection");
+  const handle = await persistence.open(id, "read");
+  try {
+    const result = await handle.read();
+    return { meta: handle.header, events: result.events };
+  } finally {
+    await handle.close();
+  }
+}
+
+// src/approvals.ts
 function parseApprovalCommand(text) {
   const trimmed = text.trim();
   if (!/^\/(?:approve|reject)(?:\s|$)/i.test(trimmed)) return void 0;
   const match = /^\/(approve|reject)\s+([0-9]{6})$/i.exec(trimmed);
-  if (match === null) return "invalid";
+  if (match === null) {
+    if (/^\/(?:approve|reject)\s+[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(trimmed)) return void 0;
+    return "invalid";
+  }
   return {
     code: match[2],
     outcome: match[1]?.toLowerCase() === "approve" ? "allowed-once" : "rejected"
@@ -120,7 +143,7 @@ function formatApprovalPrompt(request, code, timeoutMs) {
   ].join("\n");
 }
 function approvalDetail(request) {
-  const call = request.callId === void 0 ? void 0 : [...request.agent.session.events].reverse().find((event) => event.type === "tool/call" && event.data.callId === request.callId);
+  const call = request.callId === void 0 ? void 0 : [...sessionEvents(request.agent)].reverse().find((event) => event.type === "tool/call" && event.data.callId === request.callId);
   if (call?.type === "tool/call") {
     try {
       const parsed = JSON.parse(call.data.arguments);
@@ -141,7 +164,6 @@ function isRecord(value) {
 }
 
 // src/conversations.ts
-import { resolveSessionPreset } from "@deepseek-ai/dsh-agent-presets";
 import { parseCommand } from "@deepseek-ai/dsh-commands";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { SessionId } from "@deepseek-ai/dsh-session";
@@ -433,6 +455,20 @@ async function readBounded(path, maxBytes) {
   }
 }
 
+// src/preset-compat.ts
+function resolvePresetFromApi(session, api) {
+  if (typeof api.resolveSessionPreset === "function") return api.resolveSessionPreset(session);
+  const projection = api.agentPresetProjectionDefinition;
+  if (projection === void 0) throw new Error("deepseek-harness-weixin: no compatible agent preset resolver found");
+  let state = projection.init(session.header);
+  for (const event of session.events) state = projection.apply(state, event);
+  return state ?? void 0;
+}
+async function resolveSessionPresetCompat(session) {
+  const api = await import("@deepseek-ai/dsh-agent-presets");
+  return resolvePresetFromApi(session, api);
+}
+
 // src/conversations.ts
 var ConversationManager = class {
   constructor(ctx, config, accountId) {
@@ -457,7 +493,10 @@ var ConversationManager = class {
       this.ctx.permissionPresets.resolve(this.config.permissionPreset);
     }
     const headers = await this.ctx.sessionPersistence.list();
-    this.persistedIds = new Set(headers.map((header) => String(header.id)));
+    this.persistedIds = new Set(headers.map((snapshot) => {
+      const legacy = snapshot;
+      return String(snapshot.header?.id ?? legacy.id);
+    }));
   }
   /** Process one inbound message after earlier work for the same Weixin user. */
   process(message, api, sendApprovalPrompt) {
@@ -534,7 +573,7 @@ var ConversationManager = class {
       agent.session.header?.cwd ?? this.config.cwd
     );
     await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness conversation availability");
-    const start = agent.session.events.length;
+    const start = sessionEvents(agent).length;
     const userMessage = createUserMessage({ content, source: { kind: "user" } });
     const sendPrompt = sendApprovalPrompt ?? ((text) => {
       const to = message.from_user_id?.trim();
@@ -548,13 +587,17 @@ var ConversationManager = class {
     );
     try {
       agent.followup(userMessage);
-      try {
-        await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness response");
-      } catch (error) {
-        agent.cancel({ kind: "user" });
-        throw error;
+      const watch = new AbortController();
+      const accepted = await Promise.race([
+        waitForWorkhubAcceptance(agent, start, watch.signal),
+        withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness response").then(() => false)
+      ]);
+      watch.abort();
+      if (accepted) {
+        agent.cancel({ kind: "hook", reason: "workhub_task_accepted" });
+        return { text: "", images: [], files: [], suppressDelivery: true };
       }
-      return this.collectReply(agent, agent.session.events.slice(start), userMessage.id);
+      return this.collectReply(agent, sessionEvents(agent).slice(start), userMessage.id);
     } finally {
       stopApprovalAnswerer();
     }
@@ -567,7 +610,7 @@ var ConversationManager = class {
     if (parsed === void 0) {
       return { kind: "unknown", available: this.ctx.commands.list(agent).map((command) => `/${command.name}`) };
     }
-    const start = agent.session.events.length;
+    const start = sessionEvents(agent).length;
     const sendPrompt = sendApprovalPrompt ?? ((text) => {
       const to = message.from_user_id?.trim();
       if (!to) return Promise.reject(new Error("Weixin approval has no target user"));
@@ -583,7 +626,7 @@ var ConversationManager = class {
       controller.abort(new Error(`DeepSeek Harness command timed out after ${this.config.responseTimeoutMs}ms`));
     }, this.config.responseTimeoutMs);
     try {
-      const execution = await this.ctx.commands.execute(agent, line, controller.signal);
+      const execution = await this.ctx.commands.execute(agent, line, [], controller.signal);
       if (execution === void 0) {
         return { kind: "unknown", available: this.ctx.commands.list(agent).map((command) => `/${command.name}`) };
       }
@@ -594,7 +637,7 @@ var ConversationManager = class {
         agent.cancel({ kind: "user" });
         throw error;
       }
-      const generated = await this.collectLatestReply(agent, agent.session.events.slice(start));
+      const generated = await this.collectLatestReply(agent, sessionEvents(agent).slice(start));
       const resultText = execution.result.kind === "error" ? `\u547D\u4EE4\u6267\u884C\u5931\u8D25\uFF1A${execution.result.text}` : execution.result.text?.trim() || `\u547D\u4EE4 /${parsed.name} \u5DF2\u6267\u884C\u3002`;
       return {
         kind: "handled",
@@ -692,8 +735,8 @@ var ConversationManager = class {
     const current = this.ctx.agentDefaultModel.currentSelection();
     const agentOptions = { provider: current.provider, model: current.model };
     if (this.persistedIds.has(id)) {
-      const inspected = await this.ctx.sessionPersistence.inspect(sessionId);
-      const agentPreset2 = resolveSessionPreset({
+      const inspected = await inspectSession(this.ctx, sessionId);
+      const agentPreset2 = await resolveSessionPresetCompat({
         header: inspected.meta,
         events: inspected.events
       }) ?? this.resolveAgentPreset();
@@ -716,7 +759,7 @@ var ConversationManager = class {
         sessionId,
         meta: { cwd: this.config.cwd, agentPreset },
         agentOptions,
-        setup: (agentCtx) => this.setupAgent(agentCtx, agentPreset, this.config.permissionPreset)
+        setup: (agentCtx) => this.setupAgent(agentCtx, agentPreset)
       });
     } catch (error) {
       const raced = this.ctx.agents.get(sessionId);
@@ -724,6 +767,9 @@ var ConversationManager = class {
       throw error;
     }
     this.persistedIds.add(id);
+    if (this.config.permissionPreset !== void 0) {
+      this.ctx.permissionPresets.set(handle.agent.session, this.config.permissionPreset);
+    }
     handle.agent.inject(createUserMessage({
       content: [{ type: "text", text: this.config.systemPrompt }],
       source: { kind: "plugin", plugin: "deepseek-harness-weixin", form: "instructions" }
@@ -739,13 +785,28 @@ var ConversationManager = class {
   resolveAgentPreset() {
     return this.config.agentPreset ?? this.ctx.agentPresets.defaultId;
   }
-  async setupAgent(agentCtx, agentPreset, permissionPreset) {
+  async setupAgent(agentCtx, agentPreset) {
     await this.ctx.agentPresets.mount(agentCtx, agentPreset);
-    if (permissionPreset !== void 0) {
-      const agent = agentCtx.agent;
-      if (agent === void 0) throw new Error("weixin-channel: Agent setup context has no Agent");
-      this.ctx.permissionPresets.set(agent.session, permissionPreset);
-    }
+  }
+  enqueueWorkhubReview(sourceSessionId, reviewPrompt) {
+    if (!sourceSessionId.trim()) return Promise.reject(new Error("review_source_session_missing"));
+    return this.enqueue(sourceSessionId, async () => {
+      const binding = await this.getOrCreate(sourceSessionId);
+      const agent = binding.agent;
+      await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "Workhub review conversation availability");
+      const start = sessionEvents(agent).length;
+      const prompt = [
+        "\u8FD9\u662F Workhub \u7684\u5185\u90E8\u6267\u884C\u7ED3\u679C\u5BA1\u9605\u56DE\u5408\uFF0C\u4E0D\u662F\u7528\u6237\u539F\u59CB\u6D88\u606F\u3002",
+        "\u8BF7\u5BA1\u9605\u4EE5\u4E0B\u7ED3\u6784\u5316\u6267\u884C\u7ED3\u679C\uFF0C\u5E76\u4E14\u53EA\u8FD4\u56DE JSON\uFF1A",
+        '{"decision":"reply|waiting_user|continue","message":"\u7ED9\u7528\u6237\u7684\u7B80\u77ED\u56DE\u590D","nextTask":null}',
+        "\u53EA\u6709 diagnostic\u3001query\u3001analysis \u53EF\u4EE5\u8FD4\u56DE continue\uFF1B\u5176\u5B83\u60C5\u51B5\u5FC5\u987B\u8FD4\u56DE waiting_user\u3002",
+        JSON.stringify(reviewPrompt)
+      ].join("\n");
+      agent.followup(createUserMessage({ content: [{ type: "text", text: prompt }], source: { kind: "plugin", plugin: "workhub-review" } }));
+      await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "Workhub review response");
+      const reply = await this.collectLatestReply(agent, sessionEvents(agent).slice(start));
+      return parseWorkhubReviewDecision(reply?.text ?? "");
+    });
   }
   async collectReply(agent, events, userMessageId) {
     const texts = [];
@@ -829,6 +890,44 @@ var ConversationManager = class {
     };
   }
 };
+async function waitForWorkhubAcceptance(agent, start, signal) {
+  return new Promise((resolve3) => {
+    let timer;
+    const finish = (value) => {
+      if (timer !== void 0) clearInterval(timer);
+      signal.removeEventListener("abort", onAbort);
+      resolve3(value);
+    };
+    const onAbort = () => finish(false);
+    const check = () => {
+      const events = sessionEvents(agent).slice(start);
+      let workhubCall = false;
+      for (const event of events) {
+        if (event.type === "tool/call" && (event.data.name === "workhub_task_create" || event.data.name === "workhub_intent")) workhubCall = true;
+        if (workhubCall && event.type === "tool/result") {
+          const serialized = JSON.stringify(event.data.message);
+          if (serialized.includes("accepted") && serialized.includes("taskId")) {
+            finish(true);
+            return;
+          }
+        }
+      }
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    timer = setInterval(check, 25);
+    check();
+  });
+}
+function parseWorkhubReviewDecision(text) {
+  try {
+    const match = text.match(/\{[\s\S]*\}/);
+    const value = JSON.parse(match?.[0] ?? text);
+    const decision = value.decision === "waiting_user" || value.decision === "continue" ? value.decision : "reply";
+    return { decision, message: typeof value.message === "string" ? value.message : text, nextTask: value.nextTask && typeof value.nextTask === "object" ? value.nextTask : null };
+  } catch {
+    return { decision: "reply", message: text, nextTask: null };
+  }
+}
 
 // src/markdown-filter.ts
 var StreamingMarkdownFilter = class _StreamingMarkdownFilter {
@@ -1231,6 +1330,7 @@ var WeixinHarnessBridge = class {
   monitorAbortController;
   disconnectTask;
   connectionAttempt;
+  unregisterWorkhubTransport;
   connected = false;
   stopping = false;
   /** Resolve or create a QR credential, verify it, and begin long-polling. */
@@ -1352,7 +1452,23 @@ var WeixinHarnessBridge = class {
         this.log.error("Weixin monitor stopped unexpectedly: %s", String(error));
       }
     });
+    this.registerWorkhubTransport(api);
     return credential;
+  }
+  registerWorkhubTransport(api) {
+    const transport = this.ctx.workhubChannelTransport;
+    if (!transport) return;
+    this.unregisterWorkhubTransport?.();
+    const unregisterSender = transport.register("weixin", {
+      sendText: async (targetId, text) => {
+        await api.sendText(targetId, filterMarkdownForWeixin(truncateUtf8(text, this.config.maxReplyBytes)));
+      }
+    });
+    const unregisterReview = transport.registerReviewHandler("weixin", (job) => this.requireConversations().enqueueWorkhubReview(job.sourceSessionId, job.reviewPrompt));
+    this.unregisterWorkhubTransport = () => {
+      unregisterReview();
+      unregisterSender();
+    };
   }
   async resolveCredential(forceQr, attempt) {
     const ref = credentialRef(this.config.credentialRef);
@@ -1453,6 +1569,8 @@ var WeixinHarnessBridge = class {
     const conversations = this.conversations;
     const api = this.api;
     const credential = this.credential;
+    this.unregisterWorkhubTransport?.();
+    this.unregisterWorkhubTransport = void 0;
     this.connected = false;
     monitorAbortController?.abort(new Error("\u5FAE\u4FE1\u8FDE\u63A5\u6B63\u5728\u5207\u6362"));
     conversations?.cancelPendingApprovals();
@@ -1477,6 +1595,7 @@ var WeixinHarnessBridge = class {
     const sender = message.from_user_id?.trim();
     if (!sender || !this.allowed(sender)) return;
     if (this.seen.hasOrAdd(messageKey(message))) return;
+    this.emitWorkhubInbound(message);
     const command = commandText(message);
     const bypassCapacity = command === "/bot-cancel" || command === "/new" || command === "/reset" || parseApprovalCommand(command) !== void 0;
     while (!bypassCapacity && this.inFlight.size >= this.config.maxInFlightMessages && !this.stopping) {
@@ -1488,6 +1607,25 @@ var WeixinHarnessBridge = class {
     });
     const tracked = task.finally(() => this.inFlight.delete(tracked));
     this.inFlight.add(tracked);
+  }
+  emitWorkhubInbound(message) {
+    const emit = this.ctx.emit;
+    const senderId = message.from_user_id?.trim();
+    if (!emit || !senderId) return;
+    const targetId = senderId;
+    emit("workhub/channel-inbound", {
+      channel: "weixin",
+      externalEventId: messageKey(message),
+      senderId,
+      conversationId: message.group_id?.trim() || targetId,
+      targetId,
+      conversationType: message.group_id?.trim() ? "group" : "direct",
+      messageType: "text",
+      content: messageText(message),
+      dshSessionId: sessionIdFor(this.credential?.accountId ?? "default", message),
+      receivedAt: message.create_time_ms ? new Date(message.create_time_ms).toISOString() : void 0,
+      metadata: { channelNativeTarget: targetId }
+    });
   }
   allowed(sender) {
     if (this.config.accessPolicy === "disabled") return false;
@@ -1631,6 +1769,7 @@ var WeixinHarnessBridge = class {
     }
   }
   async sendReply(message, api, reply) {
+    if (reply.suppressDelivery) return;
     const to = message.from_user_id?.trim();
     if (!to) throw new Error("Weixin reply has no target user");
     const images = reply.images.slice(0, this.config.maxReplyImages);
@@ -1769,7 +1908,8 @@ var inject = [
   "credentials",
   "llm",
   "permissionPresets",
-  "sessionPersistence"
+  "sessionPersistence",
+  "workhubChannelTransport"
 ];
 function mountBridge(ctx, bridge, control) {
   ctx.effect(() => {

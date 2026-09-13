@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "include": [
+    "src/**/*.ts",
+    "tests/approvals.test.ts",
+    "tests/bridge.test.ts",
+    "tests/inbound.test.ts",
+    "tests/index.test.ts",
+    "tests/login.test.ts",
+    "tests/markdown-filter.test.ts",
+    "tests/outbound-files.test.ts",
+    "tests/preset-compat.test.ts",
+    "tests/protocol.test.ts",
+    "tests/util.test.ts"
+  ]
+}

@@ -4,7 +4,7 @@ import {
   requestLoginFromControlSocket,
   resolveControlSocketPath,
   waitForLoginFromControlSocket
-} from "./chunk-KCZ7FGE3.js";
+} from "./chunk-BBVIPL5P.js";
 
 // src/cli.ts
 import { realpathSync } from "fs";

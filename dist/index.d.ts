@@ -217,6 +217,7 @@ declare class WeixinHarnessBridge {
     private monitorAbortController;
     private disconnectTask;
     private connectionAttempt;
+    private unregisterWorkhubTransport;
     private connected;
     private stopping;
     constructor(ctx: Context, config: Config, apiFactory?: WeixinApiFactory, login?: WeixinLogin, showQr?: WeixinQrDisplay);
@@ -230,12 +231,14 @@ declare class WeixinHarnessBridge {
     stop(): Promise<void>;
     private launchConnection;
     private connect;
+    private registerWorkhubTransport;
     private resolveCredential;
     private monitor;
     private failureDelay;
     private disconnectActive;
     private performDisconnectActive;
     private dispatch;
+    private emitWorkhubInbound;
     private allowed;
     private handleMessage;
     private sendReply;
@@ -297,6 +300,7 @@ interface ConversationReply {
         name?: string;
     }>;
     files: OutboundFile[];
+    suppressDelivery?: boolean;
 }
 /** Result of dispatching one syntactically valid Harness slash command. */
 type ConversationCommandOutcome = {

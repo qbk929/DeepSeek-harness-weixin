@@ -1,6 +1,7 @@
 import { randomInt } from 'node:crypto'
 import type { ApprovalOutcome, ApprovalRequest } from '@deepseek-ai/dsh-user-approval'
 import { truncateUtf8 } from './util.js'
+import { sessionEvents } from './dsh-compat.js'
 
 /** A decision command intercepted by the Weixin channel. */
 export interface ApprovalCommand {
@@ -27,7 +28,10 @@ export function parseApprovalCommand(text: string): ApprovalCommand | 'invalid' 
   const trimmed = text.trim()
   if (!/^\/(?:approve|reject)(?:\s|$)/i.test(trimmed)) return undefined
   const match = /^\/(approve|reject)\s+([0-9]{6})$/i.exec(trimmed)
-  if (match === null) return 'invalid'
+  if (match === null) {
+    if (/^\/(?:approve|reject)\s+[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(trimmed)) return undefined
+    return 'invalid'
+  }
   return {
     code: match[2] as string,
     outcome: match[1]?.toLowerCase() === 'approve' ? 'allowed-once' : 'rejected',
@@ -131,7 +135,7 @@ export function formatApprovalPrompt(request: ApprovalRequest, code: string, tim
 function approvalDetail(request: ApprovalRequest): string {
   const call = request.callId === undefined
     ? undefined
-    : [...request.agent.session.events].reverse().find(event => event.type === 'tool/call'
+    : [...sessionEvents(request.agent)].reverse().find(event => event.type === 'tool/call'
         && event.data.callId === request.callId)
   if (call?.type === 'tool/call') {
     try {

@@ -965,4 +965,4 @@ export {
   displayQr,
   loginStandalone
 };
-//# sourceMappingURL=chunk-KCZ7FGE3.js.map
+//# sourceMappingURL=chunk-BBVIPL5P.js.map

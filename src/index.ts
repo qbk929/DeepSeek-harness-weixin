@@ -17,6 +17,7 @@ export const inject = [
   'llm',
   'permissionPresets',
   'sessionPersistence',
+  'workhubChannelTransport',
 ]
 export { Config }
 export type { WeixinConfig as ConfigType }

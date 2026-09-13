@@ -1,4 +1,4 @@
-import { CallId } from '@deepseek-ai/dsh-llm'
+import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { describe, expect, it, vi } from 'vitest'
 import {
   formatApprovalPrompt,
@@ -7,7 +7,7 @@ import {
 } from '../src/approvals.js'
 
 function request(options: { command?: string; reason?: string; signal?: AbortSignal } = {}) {
-  const callId = CallId('call-approval')
+  const callId = ToolCallId('call-approval')
   const events = options.command === undefined
     ? []
     : [{
@@ -32,7 +32,8 @@ function request(options: { command?: string; reason?: string; signal?: AbortSig
 describe('Weixin approval commands', () => {
   it('parses exact approve/reject commands and intercepts malformed variants', () => {
     expect(parseApprovalCommand('/approve 123456')).toEqual({ code: '123456', outcome: 'allowed-once' })
-    expect(parseApprovalCommand('/REJECT 654321')).toEqual({ code: '654321', outcome: 'rejected' })
+  expect(parseApprovalCommand('/REJECT 654321')).toEqual({ code: '654321', outcome: 'rejected' })
+  expect(parseApprovalCommand('/approve ec4706ec-0f10-4844-a7af-7f3705fa31f3')).toBeUndefined()
     expect(parseApprovalCommand('/approve')).toBe('invalid')
     expect(parseApprovalCommand('/reject abc')).toBe('invalid')
     expect(parseApprovalCommand('ordinary message')).toBeUndefined()

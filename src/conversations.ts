@@ -1,7 +1,6 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
-import { resolveSessionPreset } from '@deepseek-ai/dsh-agent-presets'
 import { parseCommand } from '@deepseek-ai/dsh-commands'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-permission-presets'
@@ -18,12 +17,21 @@ import { collectOutboundFiles, type OutboundFile } from './outbound-files.js'
 import type { WeixinApiPort } from './protocol.js'
 import type { WeixinMessage } from './types.js'
 import { sessionIdFor, withTimeout } from './util.js'
+import { resolveSessionPresetCompat } from './preset-compat.js'
+import { inspectSession, sessionEvents } from './dsh-compat.js'
 
 /** Completed response from one Weixin-triggered Harness turn. */
 export interface ConversationReply {
   text: string
   images: Array<{ data: Uint8Array; mediaType: string; name?: string }>
   files: OutboundFile[]
+  suppressDelivery?: boolean
+}
+
+export interface WorkhubReviewDecision {
+  decision: 'reply' | 'waiting_user' | 'continue'
+  message: string
+  nextTask?: Record<string, unknown> | null
 }
 
 /** Result of dispatching one syntactically valid Harness slash command. */
@@ -61,7 +69,10 @@ export class ConversationManager {
       this.ctx.permissionPresets.resolve(this.config.permissionPreset)
     }
     const headers = await this.ctx.sessionPersistence.list()
-    this.persistedIds = new Set(headers.map(header => String(header.id)))
+    this.persistedIds = new Set(headers.map(snapshot => {
+      const legacy = snapshot as unknown as { id?: string }
+      return String(snapshot.header?.id ?? legacy.id)
+    }))
   }
 
   /** Process one inbound message after earlier work for the same Weixin user. */
@@ -162,7 +173,7 @@ export class ConversationManager {
       agent.session.header?.cwd ?? this.config.cwd,
     )
     await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness conversation availability')
-    const start = agent.session.events.length
+    const start = sessionEvents(agent).length
     const userMessage = createUserMessage({ content, source: { kind: 'user' } })
     const sendPrompt = sendApprovalPrompt ?? ((text: string) => {
       const to = message.from_user_id?.trim()
@@ -176,13 +187,17 @@ export class ConversationManager {
     )
     try {
       agent.followup(userMessage)
-      try {
-        await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness response')
-      } catch (error) {
-        agent.cancel({ kind: 'user' })
-        throw error
+      const watch = new AbortController()
+      const accepted = await Promise.race([
+        waitForWorkhubAcceptance(agent, start, watch.signal),
+        withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness response').then(() => false),
+      ])
+      watch.abort()
+      if (accepted) {
+        agent.cancel({ kind: 'hook', reason: 'workhub_task_accepted' })
+        return { text: '', images: [], files: [], suppressDelivery: true }
       }
-      return this.collectReply(agent, agent.session.events.slice(start), userMessage.id)
+      return this.collectReply(agent, sessionEvents(agent).slice(start), userMessage.id)
     } finally {
       stopApprovalAnswerer()
     }
@@ -202,7 +217,7 @@ export class ConversationManager {
     if (parsed === undefined) {
       return { kind: 'unknown', available: this.ctx.commands.list(agent).map(command => `/${command.name}`) }
     }
-    const start = agent.session.events.length
+    const start = sessionEvents(agent).length
     const sendPrompt = sendApprovalPrompt ?? ((text: string) => {
       const to = message.from_user_id?.trim()
       if (!to) return Promise.reject(new Error('Weixin approval has no target user'))
@@ -218,7 +233,7 @@ export class ConversationManager {
       controller.abort(new Error(`DeepSeek Harness command timed out after ${this.config.responseTimeoutMs}ms`))
     }, this.config.responseTimeoutMs)
     try {
-      const execution = await this.ctx.commands.execute(agent, line, controller.signal)
+      const execution = await this.ctx.commands.execute(agent, line, [], controller.signal)
       if (execution === undefined) {
         return { kind: 'unknown', available: this.ctx.commands.list(agent).map(command => `/${command.name}`) }
       }
@@ -229,7 +244,7 @@ export class ConversationManager {
         agent.cancel({ kind: 'user' })
         throw error
       }
-      const generated = await this.collectLatestReply(agent, agent.session.events.slice(start))
+      const generated = await this.collectLatestReply(agent, sessionEvents(agent).slice(start))
       const resultText = execution.result.kind === 'error'
         ? `命令执行失败：${execution.result.text}`
         : execution.result.text?.trim() || `命令 /${parsed.name} 已执行。`
@@ -341,8 +356,8 @@ export class ConversationManager {
     const current = this.ctx.agentDefaultModel.currentSelection()
     const agentOptions = { provider: current.provider, model: current.model }
     if (this.persistedIds.has(id)) {
-      const inspected = await this.ctx.sessionPersistence.inspect(sessionId)
-      const agentPreset = resolveSessionPreset({
+      const inspected = await inspectSession(this.ctx, sessionId)
+      const agentPreset = await resolveSessionPresetCompat({
         header: inspected.meta,
         events: inspected.events,
       }) ?? this.resolveAgentPreset()
@@ -366,7 +381,7 @@ export class ConversationManager {
         sessionId,
         meta: { cwd: this.config.cwd, agentPreset },
         agentOptions,
-        setup: agentCtx => this.setupAgent(agentCtx, agentPreset, this.config.permissionPreset),
+      setup: agentCtx => this.setupAgent(agentCtx, agentPreset),
       })
     } catch (error) {
       const raced = this.ctx.agents.get(sessionId)
@@ -374,6 +389,9 @@ export class ConversationManager {
       throw error
     }
     this.persistedIds.add(id)
+    if (this.config.permissionPreset !== undefined) {
+      this.ctx.permissionPresets.set(handle.agent.session, this.config.permissionPreset)
+    }
     handle.agent.inject(createUserMessage({
       content: [{ type: 'text', text: this.config.systemPrompt }],
       source: { kind: 'plugin', plugin: 'deepseek-harness-weixin', form: 'instructions' },
@@ -393,13 +411,29 @@ export class ConversationManager {
     return this.config.agentPreset ?? this.ctx.agentPresets.defaultId
   }
 
-  private async setupAgent(agentCtx: Context, agentPreset: string, permissionPreset?: string): Promise<void> {
+  private async setupAgent(agentCtx: Context, agentPreset: string): Promise<void> {
     await this.ctx.agentPresets.mount(agentCtx, agentPreset)
-    if (permissionPreset !== undefined) {
-      const agent = agentCtx.agent
-      if (agent === undefined) throw new Error('weixin-channel: Agent setup context has no Agent')
-      this.ctx.permissionPresets.set(agent.session, permissionPreset)
-    }
+  }
+
+  enqueueWorkhubReview(sourceSessionId: string, reviewPrompt: Record<string, unknown>): Promise<WorkhubReviewDecision> {
+    if (!sourceSessionId.trim()) return Promise.reject(new Error('review_source_session_missing'))
+    return this.enqueue(sourceSessionId, async () => {
+      const binding = await this.getOrCreate(sourceSessionId)
+      const agent = binding.agent
+      await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'Workhub review conversation availability')
+      const start = sessionEvents(agent).length
+      const prompt = [
+        '这是 Workhub 的内部执行结果审阅回合，不是用户原始消息。',
+        '请审阅以下结构化执行结果，并且只返回 JSON：',
+        '{"decision":"reply|waiting_user|continue","message":"给用户的简短回复","nextTask":null}',
+        '只有 diagnostic、query、analysis 可以返回 continue；其它情况必须返回 waiting_user。',
+        JSON.stringify(reviewPrompt),
+      ].join('\n')
+      agent.followup(createUserMessage({ content: [{ type: 'text', text: prompt }], source: { kind: 'plugin', plugin: 'workhub-review' } }))
+      await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'Workhub review response')
+      const reply = await this.collectLatestReply(agent, sessionEvents(agent).slice(start))
+      return parseWorkhubReviewDecision(reply?.text ?? '')
+    })
   }
 
   private async collectReply(
@@ -498,5 +532,38 @@ export class ConversationManager {
       images,
       files: collected.files,
     }
+  }
+}
+
+async function waitForWorkhubAcceptance(agent: Agent, start: number, signal: AbortSignal): Promise<boolean> {
+  return new Promise(resolve => {
+    let timer: ReturnType<typeof setInterval> | undefined
+    const finish = (value: boolean): void => { if (timer !== undefined) clearInterval(timer); signal.removeEventListener('abort', onAbort); resolve(value) }
+    const onAbort = (): void => finish(false)
+    const check = (): void => {
+      const events = sessionEvents(agent).slice(start)
+      let workhubCall = false
+      for (const event of events) {
+        if (event.type === 'tool/call' && (event.data.name === 'workhub_task_create' || event.data.name === 'workhub_intent')) workhubCall = true
+        if (workhubCall && event.type === 'tool/result') {
+          const serialized = JSON.stringify(event.data.message)
+          if (serialized.includes('accepted') && serialized.includes('taskId')) { finish(true); return }
+        }
+      }
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+    timer = setInterval(check, 25)
+    check()
+  })
+}
+
+function parseWorkhubReviewDecision(text: string): WorkhubReviewDecision {
+  try {
+    const match = text.match(/\{[\s\S]*\}/)
+    const value = JSON.parse(match?.[0] ?? text) as Record<string, unknown>
+    const decision = value.decision === 'waiting_user' || value.decision === 'continue' ? value.decision : 'reply'
+    return { decision, message: typeof value.message === 'string' ? value.message : text, nextTask: value.nextTask && typeof value.nextTask === 'object' ? value.nextTask as Record<string, unknown> : null }
+  } catch {
+    return { decision: 'reply', message: text, nextTask: null }
   }
 }

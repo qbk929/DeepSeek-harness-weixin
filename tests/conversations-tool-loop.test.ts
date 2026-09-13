@@ -3,7 +3,7 @@ import AgentRegistry from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import CommandRuntime from '@deepseek-ai/dsh-commands'
 import {
-  CallId,
+  ToolCallId,
   LlmAdapter,
   type GenerateOptions,
   type LlmResolvedModelInfo,
@@ -40,7 +40,7 @@ function textResponse(text: string): StreamChunk[] {
 }
 
 function toolCallResponse(): StreamChunk[] {
-  const callId = CallId('call-list-files')
+  const callId = ToolCallId('call-list-files')
   const args = JSON.stringify({ path: '.' })
   return [
     { type: 'block-start', index: 0, blockType: 'text' },
@@ -59,7 +59,7 @@ function toolCallResponse(): StreamChunk[] {
 }
 
 function approvalToolCallResponse(): StreamChunk[] {
-  const callId = CallId('call-approved-bash')
+  const callId = ToolCallId('call-approved-bash')
   const args = JSON.stringify({ command: 'ls -la' })
   return [
     { type: 'block-start', index: 0, blockType: 'tool-call' },
@@ -291,7 +291,7 @@ describe('ConversationManager real Agent Loop', () => {
       expect(events.some(event => event.type === 'tool/call'
         && event.data.name === 'list_files')).toBe(true)
       expect(events.some(event => event.type === 'tool/result'
-        && event.data.message.source.callId === CallId('call-list-files'))).toBe(true)
+        && event.data.message.source.callId === ToolCallId('call-list-files'))).toBe(true)
       expect(events.some(event => event.type === 'turn/end'
         && event.data.reason.kind === 'completed')).toBe(true)
 
@@ -416,10 +416,10 @@ describe('ConversationManager real Agent Loop', () => {
       expect(agent.session.events.some(event => event.type === 'approval/decided'
         && event.data.outcome === 'allowed-once')).toBe(true)
       expect(agent.session.events.some(event => event.type === 'tool/call'
-        && event.data.callId === CallId('call-approved-bash')
+        && event.data.callId === ToolCallId('call-approved-bash')
         && event.data.name === 'bash')).toBe(true)
       expect(agent.session.events.some(event => event.type === 'tool/result'
-        && event.data.message.source.callId === CallId('call-approved-bash'))).toBe(true)
+        && event.data.message.source.callId === ToolCallId('call-approved-bash'))).toBe(true)
       expect(agent.session.events.some(event => event.type === 'turn/end'
         && event.data.reason.kind === 'completed')).toBe(true)
     } finally {
