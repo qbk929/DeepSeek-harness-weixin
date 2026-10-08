@@ -19,6 +19,8 @@ import type { WeixinMessage } from './types.js'
 import { sessionIdFor, withTimeout } from './util.js'
 import { resolveSessionPresetCompat } from './preset-compat.js'
 import { inspectSession, sessionEvents } from './dsh-compat.js'
+import { DshChannelQuestionBroker } from '../../../workhub/dsh-adapter/channel-question-broker.js'
+import type { DshAgentLike } from '../../../workhub/dsh-adapter/runtime.js'
 
 /** Completed response from one Weixin-triggered Harness turn. */
 export interface ConversationReply {
@@ -32,6 +34,7 @@ export interface WorkhubReviewDecision {
   decision: 'reply' | 'waiting_user' | 'continue'
   message: string
   nextTask?: Record<string, unknown> | null
+  questionDelivered?: boolean
 }
 
 /** Result of dispatching one syntactically valid Harness slash command. */
@@ -53,6 +56,7 @@ export class ConversationManager {
   private readonly activeIds = new Map<string, string>()
   private readonly rotations = new Map<string, Promise<unknown>>()
   private readonly approvals: WeixinApprovalRegistry
+  private readonly questions = new DshChannelQuestionBroker()
   private persistedIds = new Set<string>()
 
   constructor(
@@ -142,6 +146,50 @@ export class ConversationManager {
     return this.approvals.decide(this.activeIdFor(sessionIdFor(this.accountId, message)), command)
   }
 
+  decideUnambiguousApproval(message: WeixinMessage, text: string): ResolvedApproval | 'ambiguous' | undefined {
+    return this.approvals.decideUnambiguous(this.activeIdFor(sessionIdFor(this.accountId, message)), text)
+  }
+
+  async hasPendingQuestion(message: WeixinMessage): Promise<boolean> {
+    try {
+      const baseId = sessionIdFor(this.accountId, message)
+      const id = this.activeIdFor(baseId)
+      const agent = this.bindings.get(id)?.agent ?? this.ctx.agents.get(SessionId(id))
+      return this.questions.hasPending(id, agent as unknown as DshAgentLike | undefined)
+    } catch { return false }
+  }
+
+  async answerQuestion(message: WeixinMessage, text: string, api: WeixinApiPort): Promise<{ handled: boolean; response?: ConversationReply }> {
+    const baseId = sessionIdFor(this.accountId, message)
+    const rotation = this.rotations.get(baseId) ?? Promise.resolve()
+    await rotation.catch(() => undefined)
+    const id = this.activeIdFor(baseId)
+    const existingAgent = this.bindings.get(id)?.agent ?? this.ctx.agents.get(SessionId(id))
+    if (!existingAgent) return { handled: false }
+    const run = async (): Promise<{ handled: boolean; response?: ConversationReply }> => {
+      const agent = existingAgent
+      if (!this.questions.hasPending(id, agent as unknown as DshAgentLike)) return { handled: false }
+      const start = sessionEvents(agent).length
+      const result = await this.questions.answerIncoming(id, agent as unknown as DshAgentLike, text)
+      if (result === 'not_pending' || result === 'ambiguous') return { handled: false }
+      if (result === 'blocking') return { handled: true }
+      const watch = new AbortController()
+      const accepted = await Promise.race([
+        waitForWorkhubAcceptance(agent, start, watch.signal),
+        withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DSH continued-question response').then(() => false),
+      ])
+      watch.abort()
+      if (accepted) {
+        agent.cancel({ kind: 'hook', reason: 'workhub_task_accepted' })
+        return { handled: true, response: { text: '', images: [], files: [], suppressDelivery: true } }
+      }
+      const response = await this.collectLatestReply(agent, sessionEvents(agent).slice(start))
+      return response ? { handled: true, response } : { handled: true }
+    }
+    if (this.questions.hasBlocking(id)) return run()
+    return this.enqueue(id, run)
+  }
+
   /** Close pending approval answerers before the bridge waits for in-flight messages. */
   cancelPendingApprovals(): void {
     this.approvals.cancelAll()
@@ -185,6 +233,7 @@ export class ConversationManager {
       request => this.approvals.request(id, request, sendPrompt),
       { prepend: true },
     )
+    const stopQuestionAnswerer = this.questions.register({ agentContext: agent.ctx, sourceSessionId: id, sendPrompt })
     try {
       agent.followup(userMessage)
       const watch = new AbortController()
@@ -200,6 +249,7 @@ export class ConversationManager {
       return this.collectReply(agent, sessionEvents(agent).slice(start), userMessage.id)
     } finally {
       stopApprovalAnswerer()
+      stopQuestionAnswerer()
     }
   }
 
@@ -228,6 +278,7 @@ export class ConversationManager {
       request => this.approvals.request(id, request, sendPrompt),
       { prepend: true },
     )
+    const stopQuestionAnswerer = this.questions.register({ agentContext: agent.ctx, sourceSessionId: id, sendPrompt })
     const controller = new AbortController()
     const timer = setTimeout(() => {
       controller.abort(new Error(`DeepSeek Harness command timed out after ${this.config.responseTimeoutMs}ms`))
@@ -261,6 +312,7 @@ export class ConversationManager {
     } finally {
       clearTimeout(timer)
       stopApprovalAnswerer()
+      stopQuestionAnswerer()
     }
   }
 
@@ -408,31 +460,41 @@ export class ConversationManager {
   }
 
   private resolveAgentPreset(): string {
-    return this.config.agentPreset ?? this.ctx.agentPresets.defaultId
+    const presets = (this.ctx as Context & { agentPresets: { defaultId: string } }).agentPresets
+    return this.config.agentPreset ?? presets.defaultId
   }
 
   private async setupAgent(agentCtx: Context, agentPreset: string): Promise<void> {
-    await this.ctx.agentPresets.mount(agentCtx, agentPreset)
+    const presets = (this.ctx as Context & { agentPresets: { mount(ctx: Context, id: string): Promise<void> } }).agentPresets
+    await presets.mount(agentCtx, agentPreset)
   }
 
-  enqueueWorkhubReview(sourceSessionId: string, reviewPrompt: Record<string, unknown>): Promise<WorkhubReviewDecision> {
+  enqueueWorkhubReview(sourceSessionId: string, reviewPrompt: Record<string, unknown>, sendQuestionPrompt: (text: string) => Promise<void>): Promise<WorkhubReviewDecision> {
     if (!sourceSessionId.trim()) return Promise.reject(new Error('review_source_session_missing'))
     return this.enqueue(sourceSessionId, async () => {
       const binding = await this.getOrCreate(sourceSessionId)
       const agent = binding.agent
       await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'Workhub review conversation availability')
       const start = sessionEvents(agent).length
+      const presentedBefore = this.questions.presentationCount(sourceSessionId)
       const prompt = [
         '这是 Workhub 的内部执行结果审阅回合，不是用户原始消息。',
-        '请审阅以下结构化执行结果，并且只返回 JSON：',
-        '{"decision":"reply|waiting_user|continue","message":"给用户的简短回复","nextTask":null}',
-        '只有 diagnostic、query、analysis 可以返回 continue；其它情况必须返回 waiting_user。',
+        '你是 DSH Supervisor。只使用结构化 decisionRequests 决定是否提问；待决问题必须通过原生 ask_user_question 逐个询问。',
+        'Review 模式下，每个待决问题都必须收到用户回答后才能继续。Supervised 模式只可依据偏好、项目规则或工程默认解决可逆的 presentation、wording、implementation_detail；其它类别必须问用户。',
+        '只有 diagnostic、query、analysis 可以继续。请输出 JSON：{"decision":"reply|waiting_user|continue","message":"简短说明","nextTask":{"objective":"...","instructions":"...","decisionResolutions":[{"requestId":"...","answer":"...","source":"user|personal_preference|project_rule|engineering_default","rationale":"..."}]}}。用户尚未回答时用 waiting_user。',
         JSON.stringify(reviewPrompt),
       ].join('\n')
+      const stopApprovalAnswerer = agent.ctx.on('approval/request', request => this.approvals.request(sourceSessionId, request, sendQuestionPrompt), { prepend: true })
+      const stopQuestionAnswerer = this.questions.register({ agentContext: agent.ctx, sourceSessionId, sendPrompt: sendQuestionPrompt })
       agent.followup(createUserMessage({ content: [{ type: 'text', text: prompt }], source: { kind: 'plugin', plugin: 'workhub-review' } }))
-      await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'Workhub review response')
-      const reply = await this.collectLatestReply(agent, sessionEvents(agent).slice(start))
-      return parseWorkhubReviewDecision(reply?.text ?? '')
+      try {
+        await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'Workhub review response')
+        const reply = await this.collectLatestReply(agent, sessionEvents(agent).slice(start))
+        return { ...parseWorkhubReviewDecision(reply?.text ?? ''), questionDelivered: this.questions.presentationCount(sourceSessionId) > presentedBefore }
+      } finally {
+        stopApprovalAnswerer()
+        stopQuestionAnswerer()
+      }
     })
   }
 

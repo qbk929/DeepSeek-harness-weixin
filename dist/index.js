@@ -29,15 +29,34 @@ import { credentialRef } from "@deepseek-ai/dsh-credentials";
 // src/approvals.ts
 import { randomInt } from "crypto";
 
-// src/dsh-compat.ts
+// ../../workhub/dsh-adapter/runtime.ts
+function getDshService(ctx, name2) {
+  if (!isRecord(ctx)) return void 0;
+  const direct = ctx[name2];
+  if (direct !== void 0) return direct;
+  const get = ctx.get;
+  if (typeof get === "function") {
+    try {
+      return get.call(ctx, name2);
+    } catch {
+      return void 0;
+    }
+  }
+  return void 0;
+}
 function sessionEvents(agent) {
+  if (!isRecord(agent) || !isRecord(agent.session)) return [];
   const session = agent.session;
   return session.snapshotEvents?.() ?? session.events ?? [];
 }
 async function inspectSession(ctx, id) {
-  const persistence = ctx.sessionPersistence;
-  if (persistence.inspect !== void 0) return persistence.inspect(id);
-  if (persistence.open === void 0) throw new Error("DSH session persistence does not support inspection");
+  const persistence = getDshService(ctx, "sessionPersistence");
+  if (!persistence) throw new Error("dsh_session_persistence_unavailable");
+  if (typeof persistence.inspect === "function") {
+    const result = await persistence.inspect(id);
+    return { meta: result.meta ?? result.header ?? {}, events: result.events };
+  }
+  if (typeof persistence.open !== "function") throw new Error("dsh_session_inspection_unavailable");
   const handle = await persistence.open(id, "read");
   try {
     const result = await handle.read();
@@ -45,6 +64,50 @@ async function inspectSession(ctx, id) {
   } finally {
     await handle.close();
   }
+}
+function resolvePresetFromApi(session, api) {
+  if (typeof api.resolveSessionPreset === "function") return api.resolveSessionPreset(session);
+  const projection = api.agentPresetProjectionDefinition;
+  if (!projection) throw new Error("dsh_session_preset_resolver_unavailable");
+  let state = projection.init(session.header);
+  for (const event of session.events) state = projection.apply(state, event);
+  return state ?? void 0;
+}
+async function resolveSessionPreset(session) {
+  const packageName = "@deepseek-ai/dsh-agent-presets";
+  const api = await import(packageName);
+  return resolvePresetFromApi(session, api);
+}
+function registerUserQuestionAnswerer(ctx, answerer) {
+  if (!isRecord(ctx) || typeof ctx.on !== "function") throw new Error("dsh_question_event_api_unavailable");
+  const disposer = ctx.on.call(ctx, "user-questions/request", answerer, { prepend: true });
+  if (typeof disposer === "function") return disposer;
+  return () => void 0;
+}
+function pendingUserQuestions(agent) {
+  if (!isRecord(agent) || !isRecord(agent.session)) return [];
+  const projections = getDshService(agent.ctx, "sessionProjections");
+  if (!projections || typeof projections.stateOf !== "function") return [];
+  const view = projections.stateOf.call(projections, agent.session, "userQuestions");
+  if (!isRecord(view) || !isRecord(view.questions) || !Array.isArray(view.questions.active)) return [];
+  return view.questions.active.filter((item) => isRecord(item) && typeof item.callId === "string" && Array.isArray(item.questions) && item.state === "continued");
+}
+function answerContinuedQuestion(agent, callId, answer) {
+  if (!isRecord(agent) || !isRecord(agent.ctx)) return false;
+  const service = getDshService(agent.ctx, "userQuestions");
+  if (!service || typeof service.answer !== "function") return false;
+  return Boolean(service.answer.call(service, agent, callId, answer));
+}
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+// ../../workhub/dsh-adapter/approval.ts
+function parseUnambiguousApproval(text) {
+  const normalized = text.trim().replace(/[。！!]+$/u, "").toLocaleLowerCase();
+  if (/^(?:批准|同意|approve|allow)$/u.test(normalized)) return "allowed-once";
+  if (/^(?:拒绝|不批准|reject|deny)$/u.test(normalized)) return "rejected";
+  return void 0;
 }
 
 // src/approvals.ts
@@ -112,6 +175,14 @@ var WeixinApprovalRegistry = class {
       toolName: pending.toolName
     };
   }
+  decideUnambiguous(conversationId, text) {
+    const outcome = parseUnambiguousApproval(text);
+    if (!outcome) return void 0;
+    const pending = [...this.pending.values()].filter((item) => item.conversationId === conversationId);
+    if (pending.length === 0) return void 0;
+    if (pending.length !== 1) return "ambiguous";
+    return this.decide(conversationId, { code: pending[0].code, outcome });
+  }
   /** Cancel every pending request for one conversation. */
   cancelConversation(conversationId) {
     let cancelled = false;
@@ -147,7 +218,7 @@ function approvalDetail(request) {
   if (call?.type === "tool/call") {
     try {
       const parsed = JSON.parse(call.data.arguments);
-      if (isRecord(parsed) && typeof parsed.command === "string" && parsed.command.trim()) {
+      if (isRecord2(parsed) && typeof parsed.command === "string" && parsed.command.trim()) {
         return truncateUtf8(parsed.command, 2e3, "\n[\u547D\u4EE4\u5DF2\u622A\u65AD]");
       }
     } catch {
@@ -159,7 +230,7 @@ function approvalDetail(request) {
 function approvalKey(conversationId, code) {
   return `${conversationId}\0${code}`;
 }
-function isRecord(value) {
+function isRecord2(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
@@ -455,18 +526,96 @@ async function readBounded(path, maxBytes) {
   }
 }
 
-// src/preset-compat.ts
-function resolvePresetFromApi(session, api) {
-  if (typeof api.resolveSessionPreset === "function") return api.resolveSessionPreset(session);
-  const projection = api.agentPresetProjectionDefinition;
-  if (projection === void 0) throw new Error("deepseek-harness-weixin: no compatible agent preset resolver found");
-  let state = projection.init(session.header);
-  for (const event of session.events) state = projection.apply(state, event);
-  return state ?? void 0;
+// ../../workhub/dsh-adapter/channel-question-broker.ts
+var DshChannelQuestionBroker = class {
+  pending = /* @__PURE__ */ new Map();
+  presented = /* @__PURE__ */ new Map();
+  register(input) {
+    return registerUserQuestionAnswerer(input.agentContext, async (request, next) => {
+      if (request.questions.length !== 1) {
+        throw new Error("dsh_channel_asks_one_question_per_turn");
+      }
+      const question = request.questions[0];
+      if (this.pending.has(input.sourceSessionId)) throw new Error("dsh_channel_question_already_pending");
+      const answer = Promise.withResolvers();
+      let settled = false;
+      const pending = {
+        questionId: question.id,
+        ...question.options ? { options: question.options } : {},
+        ...question.multiSelect !== void 0 ? { multiSelect: question.multiSelect } : {},
+        finish: (value) => {
+          if (settled) return false;
+          settled = true;
+          request.signal?.removeEventListener("abort", onAbort);
+          answer.resolve(value);
+          return true;
+        }
+      };
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        this.pending.delete(input.sourceSessionId);
+        answer.reject(request.signal?.reason ?? new Error("dsh_channel_question_aborted"));
+      };
+      this.pending.set(input.sourceSessionId, pending);
+      request.signal?.addEventListener("abort", onAbort, { once: true });
+      try {
+        await input.sendPrompt(renderQuestion(question), request.signal);
+        this.presented.set(input.sourceSessionId, (this.presented.get(input.sourceSessionId) ?? 0) + 1);
+        return await answer.promise;
+      } catch (error) {
+        if (!settled) {
+          settled = true;
+          request.signal?.removeEventListener("abort", onAbort);
+          if (this.pending.get(input.sourceSessionId) === pending) this.pending.delete(input.sourceSessionId);
+        }
+        if (request.signal?.aborted) throw request.signal.reason ?? error;
+        return next();
+      } finally {
+        if (this.pending.get(input.sourceSessionId) === pending) this.pending.delete(input.sourceSessionId);
+      }
+    });
+  }
+  presentationCount(sourceSessionId) {
+    return this.presented.get(sourceSessionId) ?? 0;
+  }
+  hasPending(sourceSessionId, agent) {
+    return this.pending.has(sourceSessionId) || Boolean(agent && pendingUserQuestions(agent).length > 0);
+  }
+  hasBlocking(sourceSessionId) {
+    return this.pending.has(sourceSessionId);
+  }
+  async answerIncoming(sourceSessionId, agent, text) {
+    const blocking = this.pending.get(sourceSessionId);
+    if (blocking) return blocking.finish(makeAnswer(blocking.questionId, blocking.options, text, blocking.multiSelect)) ? "blocking" : "not_pending";
+    if (!agent) return "not_pending";
+    const continued = pendingUserQuestions(agent);
+    if (continued.length === 0) return "not_pending";
+    if (continued.length !== 1 || continued[0].questions.length !== 1) return "ambiguous";
+    const question = continued[0].questions[0];
+    const answer = makeAnswer(question.id, question.options, text, question.multiSelect);
+    return answerContinuedQuestion(agent, continued[0].callId, answer) ? "timed" : "not_pending";
+  }
+};
+function makeAnswer(id, options, raw, multiSelect = false) {
+  const text = raw.trim();
+  if (/^(skip|pass|跳过|暂不回答)$/iu.test(text)) return { answers: [{ id, selected: [] }] };
+  const choices = (options ?? []).map((option) => option.label);
+  if (choices.length > 0) {
+    const parts = multiSelect ? text.split(/[，,、]/u).map((part) => part.trim()).filter(Boolean) : [text];
+    const selected = parts.map((part) => {
+      if (/^[1-9][0-9]*$/u.test(part)) return choices[Number(part) - 1];
+      return choices.find((choice) => choice.toLocaleLowerCase() === part.toLocaleLowerCase());
+    });
+    if (selected.length > 0 && selected.every((value) => Boolean(value))) {
+      return { answers: [{ id, selected: [...new Set(selected)] }] };
+    }
+  }
+  return { answers: [{ id, selected: [], ...text ? { custom: text } : {} }] };
 }
-async function resolveSessionPresetCompat(session) {
-  const api = await import("@deepseek-ai/dsh-agent-presets");
-  return resolvePresetFromApi(session, api);
+function renderQuestion(question) {
+  const options = (question.options ?? []).map((option, index) => `${index + 1}. ${option.label}${option.description ? ` - ${option.description}` : ""}`);
+  return [question.header, question.question, question.detail, options.length ? options.join("\n") : "", "\u76F4\u63A5\u56DE\u590D\u4F60\u7684\u9009\u62E9\u6216\u8865\u5145\uFF1B\u56DE\u590D\u201C\u8DF3\u8FC7\u201D\u53EF\u6682\u4E0D\u56DE\u7B54\u3002"].filter(Boolean).join("\n");
 }
 
 // src/conversations.ts
@@ -486,6 +635,7 @@ var ConversationManager = class {
   activeIds = /* @__PURE__ */ new Map();
   rotations = /* @__PURE__ */ new Map();
   approvals;
+  questions = new DshChannelQuestionBroker();
   persistedIds = /* @__PURE__ */ new Set();
   /** Snapshot persisted identities once before accepting traffic. */
   async initialize() {
@@ -549,6 +699,49 @@ var ConversationManager = class {
   decideApproval(message, command) {
     return this.approvals.decide(this.activeIdFor(sessionIdFor(this.accountId, message)), command);
   }
+  decideUnambiguousApproval(message, text) {
+    return this.approvals.decideUnambiguous(this.activeIdFor(sessionIdFor(this.accountId, message)), text);
+  }
+  async hasPendingQuestion(message) {
+    try {
+      const baseId = sessionIdFor(this.accountId, message);
+      const id = this.activeIdFor(baseId);
+      const agent = this.bindings.get(id)?.agent ?? this.ctx.agents.get(SessionId(id));
+      return this.questions.hasPending(id, agent);
+    } catch {
+      return false;
+    }
+  }
+  async answerQuestion(message, text, api) {
+    const baseId = sessionIdFor(this.accountId, message);
+    const rotation = this.rotations.get(baseId) ?? Promise.resolve();
+    await rotation.catch(() => void 0);
+    const id = this.activeIdFor(baseId);
+    const existingAgent = this.bindings.get(id)?.agent ?? this.ctx.agents.get(SessionId(id));
+    if (!existingAgent) return { handled: false };
+    const run = async () => {
+      const agent = existingAgent;
+      if (!this.questions.hasPending(id, agent)) return { handled: false };
+      const start = sessionEvents(agent).length;
+      const result = await this.questions.answerIncoming(id, agent, text);
+      if (result === "not_pending" || result === "ambiguous") return { handled: false };
+      if (result === "blocking") return { handled: true };
+      const watch = new AbortController();
+      const accepted = await Promise.race([
+        waitForWorkhubAcceptance(agent, start, watch.signal),
+        withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DSH continued-question response").then(() => false)
+      ]);
+      watch.abort();
+      if (accepted) {
+        agent.cancel({ kind: "hook", reason: "workhub_task_accepted" });
+        return { handled: true, response: { text: "", images: [], files: [], suppressDelivery: true } };
+      }
+      const response = await this.collectLatestReply(agent, sessionEvents(agent).slice(start));
+      return response ? { handled: true, response } : { handled: true };
+    };
+    if (this.questions.hasBlocking(id)) return run();
+    return this.enqueue(id, run);
+  }
   /** Close pending approval answerers before the bridge waits for in-flight messages. */
   cancelPendingApprovals() {
     this.approvals.cancelAll();
@@ -585,6 +778,7 @@ var ConversationManager = class {
       (request) => this.approvals.request(id, request, sendPrompt),
       { prepend: true }
     );
+    const stopQuestionAnswerer = this.questions.register({ agentContext: agent.ctx, sourceSessionId: id, sendPrompt });
     try {
       agent.followup(userMessage);
       const watch = new AbortController();
@@ -600,6 +794,7 @@ var ConversationManager = class {
       return this.collectReply(agent, sessionEvents(agent).slice(start), userMessage.id);
     } finally {
       stopApprovalAnswerer();
+      stopQuestionAnswerer();
     }
   }
   async executeCommandNow(id, message, line, api, sendApprovalPrompt) {
@@ -621,6 +816,7 @@ var ConversationManager = class {
       (request) => this.approvals.request(id, request, sendPrompt),
       { prepend: true }
     );
+    const stopQuestionAnswerer = this.questions.register({ agentContext: agent.ctx, sourceSessionId: id, sendPrompt });
     const controller = new AbortController();
     const timer = setTimeout(() => {
       controller.abort(new Error(`DeepSeek Harness command timed out after ${this.config.responseTimeoutMs}ms`));
@@ -650,6 +846,7 @@ var ConversationManager = class {
     } finally {
       clearTimeout(timer);
       stopApprovalAnswerer();
+      stopQuestionAnswerer();
     }
   }
   async rotateConversation(baseId) {
@@ -736,7 +933,7 @@ var ConversationManager = class {
     const agentOptions = { provider: current.provider, model: current.model };
     if (this.persistedIds.has(id)) {
       const inspected = await inspectSession(this.ctx, sessionId);
-      const agentPreset2 = await resolveSessionPresetCompat({
+      const agentPreset2 = await resolveSessionPreset({
         header: inspected.meta,
         events: inspected.events
       }) ?? this.resolveAgentPreset();
@@ -783,29 +980,39 @@ var ConversationManager = class {
     return { agent, release: () => Promise.resolve() };
   }
   resolveAgentPreset() {
-    return this.config.agentPreset ?? this.ctx.agentPresets.defaultId;
+    const presets = this.ctx.agentPresets;
+    return this.config.agentPreset ?? presets.defaultId;
   }
   async setupAgent(agentCtx, agentPreset) {
-    await this.ctx.agentPresets.mount(agentCtx, agentPreset);
+    const presets = this.ctx.agentPresets;
+    await presets.mount(agentCtx, agentPreset);
   }
-  enqueueWorkhubReview(sourceSessionId, reviewPrompt) {
+  enqueueWorkhubReview(sourceSessionId, reviewPrompt, sendQuestionPrompt) {
     if (!sourceSessionId.trim()) return Promise.reject(new Error("review_source_session_missing"));
     return this.enqueue(sourceSessionId, async () => {
       const binding = await this.getOrCreate(sourceSessionId);
       const agent = binding.agent;
       await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "Workhub review conversation availability");
       const start = sessionEvents(agent).length;
+      const presentedBefore = this.questions.presentationCount(sourceSessionId);
       const prompt = [
         "\u8FD9\u662F Workhub \u7684\u5185\u90E8\u6267\u884C\u7ED3\u679C\u5BA1\u9605\u56DE\u5408\uFF0C\u4E0D\u662F\u7528\u6237\u539F\u59CB\u6D88\u606F\u3002",
-        "\u8BF7\u5BA1\u9605\u4EE5\u4E0B\u7ED3\u6784\u5316\u6267\u884C\u7ED3\u679C\uFF0C\u5E76\u4E14\u53EA\u8FD4\u56DE JSON\uFF1A",
-        '{"decision":"reply|waiting_user|continue","message":"\u7ED9\u7528\u6237\u7684\u7B80\u77ED\u56DE\u590D","nextTask":null}',
-        "\u53EA\u6709 diagnostic\u3001query\u3001analysis \u53EF\u4EE5\u8FD4\u56DE continue\uFF1B\u5176\u5B83\u60C5\u51B5\u5FC5\u987B\u8FD4\u56DE waiting_user\u3002",
+        "\u4F60\u662F DSH Supervisor\u3002\u53EA\u4F7F\u7528\u7ED3\u6784\u5316 decisionRequests \u51B3\u5B9A\u662F\u5426\u63D0\u95EE\uFF1B\u5F85\u51B3\u95EE\u9898\u5FC5\u987B\u901A\u8FC7\u539F\u751F ask_user_question \u9010\u4E2A\u8BE2\u95EE\u3002",
+        "Review \u6A21\u5F0F\u4E0B\uFF0C\u6BCF\u4E2A\u5F85\u51B3\u95EE\u9898\u90FD\u5FC5\u987B\u6536\u5230\u7528\u6237\u56DE\u7B54\u540E\u624D\u80FD\u7EE7\u7EED\u3002Supervised \u6A21\u5F0F\u53EA\u53EF\u4F9D\u636E\u504F\u597D\u3001\u9879\u76EE\u89C4\u5219\u6216\u5DE5\u7A0B\u9ED8\u8BA4\u89E3\u51B3\u53EF\u9006\u7684 presentation\u3001wording\u3001implementation_detail\uFF1B\u5176\u5B83\u7C7B\u522B\u5FC5\u987B\u95EE\u7528\u6237\u3002",
+        '\u53EA\u6709 diagnostic\u3001query\u3001analysis \u53EF\u4EE5\u7EE7\u7EED\u3002\u8BF7\u8F93\u51FA JSON\uFF1A{"decision":"reply|waiting_user|continue","message":"\u7B80\u77ED\u8BF4\u660E","nextTask":{"objective":"...","instructions":"...","decisionResolutions":[{"requestId":"...","answer":"...","source":"user|personal_preference|project_rule|engineering_default","rationale":"..."}]}}\u3002\u7528\u6237\u5C1A\u672A\u56DE\u7B54\u65F6\u7528 waiting_user\u3002',
         JSON.stringify(reviewPrompt)
       ].join("\n");
+      const stopApprovalAnswerer = agent.ctx.on("approval/request", (request) => this.approvals.request(sourceSessionId, request, sendQuestionPrompt), { prepend: true });
+      const stopQuestionAnswerer = this.questions.register({ agentContext: agent.ctx, sourceSessionId, sendPrompt: sendQuestionPrompt });
       agent.followup(createUserMessage({ content: [{ type: "text", text: prompt }], source: { kind: "plugin", plugin: "workhub-review" } }));
-      await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "Workhub review response");
-      const reply = await this.collectLatestReply(agent, sessionEvents(agent).slice(start));
-      return parseWorkhubReviewDecision(reply?.text ?? "");
+      try {
+        await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "Workhub review response");
+        const reply = await this.collectLatestReply(agent, sessionEvents(agent).slice(start));
+        return { ...parseWorkhubReviewDecision(reply?.text ?? ""), questionDelivered: this.questions.presentationCount(sourceSessionId) > presentedBefore };
+      } finally {
+        stopApprovalAnswerer();
+        stopQuestionAnswerer();
+      }
     });
   }
   async collectReply(agent, events, userMessageId) {
@@ -1464,7 +1671,13 @@ var WeixinHarnessBridge = class {
         await api.sendText(targetId, filterMarkdownForWeixin(truncateUtf8(text, this.config.maxReplyBytes)));
       }
     });
-    const unregisterReview = transport.registerReviewHandler("weixin", (job) => this.requireConversations().enqueueWorkhubReview(job.sourceSessionId, job.reviewPrompt));
+    const unregisterReview = transport.registerReviewHandler("weixin", (job) => this.requireConversations().enqueueWorkhubReview(
+      job.sourceSessionId,
+      job.reviewPrompt,
+      async (text) => {
+        await api.sendText(job.targetId, filterMarkdownForWeixin(truncateUtf8(text, this.config.maxReplyBytes)));
+      }
+    ));
     this.unregisterWorkhubTransport = () => {
       unregisterReview();
       unregisterSender();
@@ -1597,7 +1810,7 @@ var WeixinHarnessBridge = class {
     if (this.seen.hasOrAdd(messageKey(message))) return;
     this.emitWorkhubInbound(message);
     const command = commandText(message);
-    const bypassCapacity = command === "/bot-cancel" || command === "/new" || command === "/reset" || parseApprovalCommand(command) !== void 0;
+    const bypassCapacity = command === "/bot-cancel" || command === "/new" || command === "/reset" || parseApprovalCommand(command) !== void 0 || parseUnambiguousApproval(command) !== void 0 || await this.requireConversations().hasPendingQuestion(message);
     while (!bypassCapacity && this.inFlight.size >= this.config.maxInFlightMessages && !this.stopping) {
       await Promise.race(this.inFlight);
     }
@@ -1647,6 +1860,18 @@ var WeixinHarnessBridge = class {
       const text = resolved === void 0 ? `\u6CA1\u6709\u627E\u5230\u5F85\u5904\u7406\u7684\u5BA1\u6279 ${approvalCommand.code}\uFF1B\u5B83\u53EF\u80FD\u5DF2\u5B8C\u6210\u3001\u53D6\u6D88\u6216\u8D85\u65F6\u3002` : resolved.outcome === "allowed-once" ? `\u5DF2\u6279\u51C6 ${resolved.toolName}\uFF08${resolved.code}\uFF09\uFF0C\u6B63\u5728\u7EE7\u7EED\u6267\u884C\u3002` : `\u5DF2\u62D2\u7EDD ${resolved.toolName}\uFF08${resolved.code}\uFF09\u3002`;
       await this.sendReply(message, api, { text, images: [], files: [] });
       return;
+    }
+    const naturalApproval = parseUnambiguousApproval(command);
+    if (naturalApproval) {
+      const resolved = this.requireConversations().decideUnambiguousApproval(message, command);
+      if (resolved === "ambiguous") {
+        await this.sendReply(message, api, { text: "\u5F53\u524D\u6709\u591A\u4E2A\u5F85\u6279\u64CD\u4F5C\uFF0C\u8BF7\u4F7F\u7528\u5BF9\u5E94\u7684 /approve 123456 \u6216 /reject 123456\u3002", images: [], files: [] });
+        return;
+      }
+      if (resolved) {
+        await this.sendReply(message, api, { text: resolved.outcome === "allowed-once" ? `\u5DF2\u6279\u51C6 ${resolved.toolName}\uFF0C\u6B63\u5728\u7EE7\u7EED\u3002` : `\u5DF2\u62D2\u7EDD ${resolved.toolName}\u3002`, images: [], files: [] });
+        return;
+      }
     }
     if (command === "/new" || command === "/reset") {
       try {
@@ -1750,6 +1975,11 @@ var WeixinHarnessBridge = class {
         images: [],
         files: []
       });
+      return;
+    }
+    const answer = await this.requireConversations().answerQuestion(message, slashLine, api);
+    if (answer.handled) {
+      if (answer.response && !answer.response.suppressDelivery) await this.sendReply(message, api, answer.response);
       return;
     }
     try {

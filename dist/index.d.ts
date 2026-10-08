@@ -269,6 +269,7 @@ declare class WeixinApprovalRegistry {
     request(conversationId: string, request: ApprovalRequest, sendPrompt: (text: string) => Promise<void>): Promise<ApprovalOutcome>;
     /** Resolve a pending request only when the command came from its originating conversation. */
     decide(conversationId: string, command: ApprovalCommand): ResolvedApproval | undefined;
+    decideUnambiguous(conversationId: string, text: string): ResolvedApproval | 'ambiguous' | undefined;
     /** Cancel every pending request for one conversation. */
     cancelConversation(conversationId: string): boolean;
     /** Cancel every pending request during channel teardown. */

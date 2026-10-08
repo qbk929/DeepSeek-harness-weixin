@@ -5,6 +5,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { parseCommand } from '@deepseek-ai/dsh-commands'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { parseApprovalCommand } from './approvals.js'
+import { parseUnambiguousApproval } from '../../../workhub/dsh-adapter/approval.js'
 import type { Config } from './config.js'
 import { ConversationManager, type ConversationReply, type WorkhubReviewDecision } from './conversations.js'
 import { displayQr, loginWithQr } from './login.js'
@@ -241,7 +242,11 @@ export class WeixinHarnessBridge {
         await api.sendText(targetId, filterMarkdownForWeixin(truncateUtf8(text, this.config.maxReplyBytes)))
       },
     })
-    const unregisterReview = transport.registerReviewHandler('weixin', job => this.requireConversations().enqueueWorkhubReview(job.sourceSessionId, job.reviewPrompt))
+    const unregisterReview = transport.registerReviewHandler('weixin', job => this.requireConversations().enqueueWorkhubReview(
+      job.sourceSessionId,
+      job.reviewPrompt,
+      async text => { await api.sendText(job.targetId, filterMarkdownForWeixin(truncateUtf8(text, this.config.maxReplyBytes))) },
+    ))
     this.unregisterWorkhubTransport = () => { unregisterReview(); unregisterSender() }
   }
 
@@ -387,6 +392,8 @@ export class WeixinHarnessBridge {
       || command === '/new'
       || command === '/reset'
       || parseApprovalCommand(command) !== undefined
+      || parseUnambiguousApproval(command) !== undefined
+      || await this.requireConversations().hasPendingQuestion(message)
     while (!bypassCapacity && this.inFlight.size >= this.config.maxInFlightMessages && !this.stopping) {
       await Promise.race(this.inFlight)
     }
@@ -443,6 +450,18 @@ export class WeixinHarnessBridge {
           : `已拒绝 ${resolved.toolName}（${resolved.code}）。`
       await this.sendReply(message, api, { text, images: [], files: [] })
       return
+    }
+    const naturalApproval = parseUnambiguousApproval(command)
+    if (naturalApproval) {
+      const resolved = this.requireConversations().decideUnambiguousApproval(message, command)
+      if (resolved === 'ambiguous') {
+        await this.sendReply(message, api, { text: '当前有多个待批操作，请使用对应的 /approve 123456 或 /reject 123456。', images: [], files: [] })
+        return
+      }
+      if (resolved) {
+        await this.sendReply(message, api, { text: resolved.outcome === 'allowed-once' ? `已批准 ${resolved.toolName}，正在继续。` : `已拒绝 ${resolved.toolName}。`, images: [], files: [] })
+        return
+      }
     }
     if (command === '/new' || command === '/reset') {
       try {
@@ -547,6 +566,12 @@ export class WeixinHarnessBridge {
         images: [],
         files: [],
       })
+      return
+    }
+
+    const answer = await this.requireConversations().answerQuestion(message, slashLine, api)
+    if (answer.handled) {
+      if (answer.response && !answer.response.suppressDelivery) await this.sendReply(message, api, answer.response)
       return
     }
 

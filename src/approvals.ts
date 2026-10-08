@@ -1,7 +1,8 @@
 import { randomInt } from 'node:crypto'
 import type { ApprovalOutcome, ApprovalRequest } from '@deepseek-ai/dsh-user-approval'
 import { truncateUtf8 } from './util.js'
-import { sessionEvents } from './dsh-compat.js'
+import { sessionEvents } from '../../../workhub/dsh-adapter/runtime.js'
+import { parseUnambiguousApproval } from '../../../workhub/dsh-adapter/approval.js'
 
 /** A decision command intercepted by the Weixin channel. */
 export interface ApprovalCommand {
@@ -95,6 +96,15 @@ export class WeixinApprovalRegistry {
       outcome: command.outcome,
       toolName: pending.toolName,
     }
+  }
+
+  decideUnambiguous(conversationId: string, text: string): ResolvedApproval | 'ambiguous' | undefined {
+    const outcome = parseUnambiguousApproval(text)
+    if (!outcome) return undefined
+    const pending = [...this.pending.values()].filter(item => item.conversationId === conversationId)
+    if (pending.length === 0) return undefined
+    if (pending.length !== 1) return 'ambiguous'
+    return this.decide(conversationId, { code: pending[0]!.code, outcome })
   }
 
   /** Cancel every pending request for one conversation. */
