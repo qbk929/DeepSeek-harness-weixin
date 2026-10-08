@@ -32,17 +32,19 @@ import { randomInt } from "crypto";
 // ../../workhub/dsh-adapter/runtime.ts
 function getDshService(ctx, name2) {
   if (!isRecord(ctx)) return void 0;
-  const direct = ctx[name2];
-  if (direct !== void 0) return direct;
-  const get = ctx.get;
-  if (typeof get === "function") {
-    try {
-      return get.call(ctx, name2);
-    } catch {
-      return void 0;
+  try {
+    const get = ctx.get;
+    if (typeof get === "function") {
+      const value = get.call(ctx, name2);
+      if (value !== void 0) return value;
     }
+  } catch {
   }
-  return void 0;
+  try {
+    return ctx[name2];
+  } catch {
+    return void 0;
+  }
 }
 function sessionEvents(agent) {
   if (!isRecord(agent) || !isRecord(agent.session)) return [];
